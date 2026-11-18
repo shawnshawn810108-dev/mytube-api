@@ -1,7 +1,8 @@
 import os
+import glob
 import shutil
 import tempfile
-import urllib.parse
+from urllib.parse import quote
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -10,69 +11,72 @@ import yt_dlp
 
 app = FastAPI()
 
-# 允許 GitHub Pages 網頁跨域呼叫
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Media-Title", "Content-Disposition"],
 )
 
-class DownloadReq(BaseModel):
+class FetchRequest(BaseModel):
     url: str
-    format: str = "MP3"  # "MP3" or "MP4"
-
-def cleanup_temp_dir(dir_path: str):
-    """傳送完畢後立即刪除整個暫存資料夾，確保雲端空間永遠歸零"""
-    try:
-        if os.path.exists(dir_path):
-            shutil.rmtree(dir_path, ignore_errors=True)
-    except Exception:
-        pass
+    format: str = "MP3"
 
 @app.get("/")
-def health():
-    return {"status": "MyTube Cloud Engine Ready (Auto-Clean Enabled)"}
+def health_check():
+    return {"status": "ok", "service": "MyTube Cloud Engine"}
 
 @app.post("/fetch")
-def fetch_media(req: DownloadReq, background_tasks: BackgroundTasks):
-    tmp_dir = tempfile.mkdtemp(prefix="mytube_")
-    is_mp3 = req.format.upper() == "MP3"
+def fetch_media(req: FetchRequest, background_tasks: BackgroundTasks):
+    temp_dir = tempfile.mkdtemp(prefix="mytube_")
+    is_mp4 = req.format.upper() == "MP4"
 
     ydl_opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio/best" if is_mp3 else "best[ext=mp4]/best",
-        "outtmpl": os.path.join(tmp_dir, "%(title)s.%(ext)s"),
+        "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
+        "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "noplaylist": True,
+        "geo_bypass": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "tv_embedded", "web"]
+            }
+        },
+        "http_headers": {
+            "User-Agent": "com.google.android.youtube/19.29.37 (Linux; U; Android 14; en_US) gzip"
+        }
     }
+
+    if is_mp4:
+        ydl_opts["format"] = "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        ydl_opts["merge_output_format"] = "mp4"
+    else:
+        ydl_opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(req.url, download=True)
-            title = info.get("title", "media")
-            filepath = ydl.prepare_filename(info)
+            title = info.get("title", "YouTube_Media")
 
-        if not os.path.exists(filepath):
-            cleanup_temp_dir(tmp_dir)
-            raise HTTPException(status_code=500, detail="下載檔案產生失敗")
+        files = [f for f in glob.glob(os.path.join(temp_dir, "*")) if os.path.isfile(f)]
+        if not files:
+            raise HTTPException(status_code=500, detail="找不到下載完成的媒體檔案")
 
-        ext = os.path.splitext(filepath)[1]
-        safe_name = urllib.parse.quote(f"{title}{ext}")
-        media_type = "audio/mp4" if is_mp3 else "video/mp4"
+        file_path = files[0]
+        ext = os.path.splitext(file_path)[1] or (".mp4" if is_mp4 else ".m4a")
+        media_type = "video/mp4" if is_mp4 else "audio/mp4"
+        encoded_title = quote(title)
 
-        # 註冊背景任務：檔案傳給 iPhone 後立刻清空暫存區
-        background_tasks.add_task(cleanup_temp_dir, tmp_dir)
+        background_tasks.add_task(shutil.rmtree, temp_dir, True)
 
         return FileResponse(
-            path=filepath,
+            path=file_path,
             media_type=media_type,
-            headers={
-                "Content-Disposition": f"attachment; filename*=UTF-8''{safe_name}",
-                "X-Media-Title": urllib.parse.quote(title),
-                "Access-Control-Expose-Headers": "X-Media-Title, Content-Disposition"
-            }
+            filename=f"{title}{ext}",
+            headers={"X-Media-Title": encoded_title}
         )
     except Exception as e:
-        cleanup_temp_dir(tmp_dir)
+        shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail=str(e))
